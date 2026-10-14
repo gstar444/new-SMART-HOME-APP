@@ -49,6 +49,7 @@ const Map<String, List<String>> _aliases = {
   'purifier': ['purifier', 'प्यूरीफायर', 'प्यूरिफायर'],
   'siren': ['siren', 'alarm', 'सायरन', 'अलार्म'],
   'lock': ['lock', 'door', 'tala', 'taala', 'darwaza', 'ताला', 'दरवाजा', 'दरवाज़ा'],
+  'plug': ['plug', 'socket', 'प्लग', 'सॉकेट'],
 };
 
 const Set<String> _onWords = {
@@ -93,9 +94,16 @@ VoiceAction? parseVoice(String raw, List<Esp32Device> devices) {
   final result = <String, bool>{};
   var lockBlocked = false;
 
+  // When a device is called by its own name ("bulb 2 on") only that device is
+  // meant - not every bulb in the house.
+  bool nameOf(Esp32Device d) =>
+      d.name.isNotEmpty && text.contains(d.name.toLowerCase());
+  final anyNamed = devices.any((d) => d.controllable && nameOf(d));
+
   for (final d in devices) {
     if (!d.controllable) continue;
-    final nameHit = text.contains(d.name.toLowerCase());
+    final nameHit = nameOf(d);
+    if (anyNamed && !nameHit) continue;
     final aliasHit = (_aliases[d.icon] ?? const <String>[]).any(tokens.contains) ||
         (d.isLock && tokens.contains('unlock'));
     if (!nameHit && !aliasHit) continue;

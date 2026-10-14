@@ -1,7 +1,21 @@
-/// Data classes for the JSON that the ESP32 firmware returns from GET /api/state.
+/// Data classes for the JSON that the ESP32 firmware returns.
 
 double? _num(Object? v) => v is num ? v.toDouble() : null;
 int? _int(Object? v) => v is num ? v.toInt() : null;
+
+/// GPIO pins offered when an older firmware does not report its own list.
+const List<int> defaultOutPins = <int>[
+  5, 13, 14, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27, 32, 33,
+];
+const List<int> defaultInPins = <int>[34, 35, 36, 39];
+
+List<int> _intList(Object? v, List<int> fallback) {
+  if (v is! List) return fallback;
+  return <int>[
+    for (final item in v)
+      if (item is num) item.toInt(),
+  ];
+}
 
 class Esp32Device {
   const Esp32Device({
@@ -14,6 +28,7 @@ class Esp32Device {
     required this.on,
     this.watts = 0,
     this.wh = 0,
+    this.pin = -1,
   });
 
   final String id;
@@ -27,6 +42,7 @@ class Esp32Device {
   final bool on;
   final double watts; // typical load, used for the energy estimate
   final double wh; // energy used since the ESP32 booted
+  final int pin; // GPIO pin, -1 = unknown (old firmware)
 
   bool get isLock => type == 'lock';
   bool get isSwitch => type == 'switch';
@@ -42,6 +58,7 @@ class Esp32Device {
         on: on ?? this.on,
         watts: watts,
         wh: wh,
+        pin: pin,
       );
 
   factory Esp32Device.fromJson(Map<String, dynamic> j) => Esp32Device(
@@ -54,6 +71,7 @@ class Esp32Device {
         on: j['on'] == true || j['on'] == 1,
         watts: _num(j['watts']) ?? 0,
         wh: _num(j['wh']) ?? 0,
+        pin: _int(j['pin']) ?? -1,
       );
 }
 
@@ -71,11 +89,16 @@ class Esp32State {
     required this.camera,
     required this.powerW,
     required this.devices,
+    this.mode = 'sta',
+    this.apSsid = '',
+    this.pinsOut = defaultOutPins,
+    this.pinsIn = defaultInPins,
+    this.maxDevices = 24,
   });
 
   final String name;
   final String fw;
-  final String ssid;
+  final String ssid; // Wi-Fi the ESP32 has joined ('' = none)
   final String ip;
   final int rssi;
   final int uptime; // seconds
@@ -85,6 +108,16 @@ class Esp32State {
   final String camera; // stream URL, empty = not configured
   final double powerW;
   final List<Esp32Device> devices;
+
+  /// "sta" (joined a router), "ap" (setup hotspot only), "ap+sta" or "offline".
+  final String mode;
+  final String apSsid; // name of the setup hotspot while it is on
+  final List<int> pinsOut; // GPIO pins a relay can use
+  final List<int> pinsIn; // extra input-only pins (PIR sensors)
+  final int maxDevices;
+
+  bool get wifiConnected => mode == 'sta' || mode == 'ap+sta';
+  bool get apActive => mode == 'ap' || mode == 'ap+sta';
 
   Esp32State withDevice(String id, {required bool on}) => _copy(
         devices: [for (final d in devices) d.id == id ? d.copyWith(on: on) : d],
@@ -105,6 +138,11 @@ class Esp32State {
         camera: camera,
         powerW: powerW,
         devices: devices ?? this.devices,
+        mode: mode,
+        apSsid: apSsid,
+        pinsOut: pinsOut,
+        pinsIn: pinsIn,
+        maxDevices: maxDevices,
       );
 
   factory Esp32State.fromJson(Map<String, dynamic> j) {
@@ -127,6 +165,90 @@ class Esp32State {
       camera: (j['camera'] as String?) ?? '',
       powerW: _num(j['powerW']) ?? 0,
       devices: list,
+      mode: (j['mode'] as String?) ?? 'sta',
+      apSsid: (j['apSsid'] as String?) ?? '',
+      pinsOut: _intList(j['pinsOut'], defaultOutPins),
+      pinsIn: _intList(j['pinsIn'], defaultInPins),
+      maxDevices: _int(j['maxDevices']) ?? 24,
     );
   }
+}
+
+/// One Wi-Fi network found by the ESP32 scan.
+class WifiNetwork {
+  const WifiNetwork({
+    required this.ssid,
+    required this.rssi,
+    required this.secure,
+  });
+
+  final String ssid;
+  final int rssi; // dBm, closer to 0 = stronger
+  final bool secure; // needs a password
+
+  factory WifiNetwork.fromJson(Map<String, dynamic> j) => WifiNetwork(
+        ssid: (j['ssid'] as String?) ?? '',
+        rssi: _int(j['rssi']) ?? -100,
+        secure: j['secure'] != false,
+      );
+}
+
+/// Answer of GET /api/wifi/scan. The ESP32 scans in the background, so the
+/// app asks again until [scanning] becomes false.
+class WifiScan {
+  const WifiScan({required this.scanning, required this.networks});
+
+  final bool scanning;
+  final List<WifiNetwork> networks;
+
+  factory WifiScan.fromJson(Map<String, dynamic> j) {
+    final raw = j['networks'];
+    final list = <WifiNetwork>[
+      if (raw is List)
+        for (final item in raw)
+          if (item is Map) WifiNetwork.fromJson(Map<String, dynamic>.from(item)),
+    ].where((n) => n.ssid.isNotEmpty).toList();
+    return WifiScan(scanning: j['scanning'] == true, networks: list);
+  }
+}
+
+/// Answer of GET /api/wifi/status.
+class WifiStatus {
+  const WifiStatus({
+    required this.state,
+    required this.connected,
+    required this.ssid,
+    required this.ip,
+    required this.rssi,
+    required this.mode,
+    required this.apSsid,
+    required this.target,
+    required this.error,
+    required this.saved,
+  });
+
+  /// "idle", "trying" (joining a new network) or "failed" (last attempt failed).
+  final String state;
+  final bool connected;
+  final String ssid;
+  final String ip;
+  final int rssi;
+  final String mode;
+  final String apSsid;
+  final String target; // network being joined while state == "trying"
+  final String error;
+  final bool saved; // a Wi-Fi is saved in the ESP32's flash
+
+  factory WifiStatus.fromJson(Map<String, dynamic> j) => WifiStatus(
+        state: (j['state'] as String?) ?? 'idle',
+        connected: j['connected'] == true,
+        ssid: (j['ssid'] as String?) ?? '',
+        ip: (j['ip'] as String?) ?? '',
+        rssi: _int(j['rssi']) ?? 0,
+        mode: (j['mode'] as String?) ?? 'sta',
+        apSsid: (j['apSsid'] as String?) ?? '',
+        target: (j['target'] as String?) ?? '',
+        error: (j['error'] as String?) ?? '',
+        saved: j['saved'] == true,
+      );
 }

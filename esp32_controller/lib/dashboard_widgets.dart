@@ -134,17 +134,20 @@ class StatusCard extends StatelessWidget {
     required this.title,
     required this.subtitle,
     required this.ok,
+    this.onTap,
   });
 
   final IconData icon;
   final String title;
   final String subtitle;
   final bool ok;
+  final VoidCallback? onTap;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return GlassCard(
+      onTap: onTap,
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
       child: Row(
         children: [

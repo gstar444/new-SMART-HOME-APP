@@ -1,7 +1,9 @@
 import 'package:flutter/material.dart';
 
+import 'esp32_api.dart';
 import 'settings.dart';
 import 'strings.dart';
+import 'wifi_page.dart';
 
 const List<int> _accentChoices = <int>[
   0xFF2F7BFF, // dashboard blue (default)
@@ -20,12 +22,16 @@ const List<int> _timeoutChoices = <int>[5, 10, 15, 30, 60];
 const List<int> _pollChoices = <int>[1, 2, 3, 5, 10, 30];
 
 class SettingsPage extends StatelessWidget {
-  const SettingsPage({super.key, required this.controller});
+  const SettingsPage({super.key, required this.controller, this.esp});
 
   final SettingsController controller;
 
+  /// Needed for the Wi-Fi connection settings entry.
+  final Esp32Controller? esp;
+
   @override
   Widget build(BuildContext context) {
+    final espController = esp;
     return ListenableBuilder(
       listenable: controller,
       builder: (context, _) {
@@ -50,6 +56,18 @@ class SettingsPage extends StatelessWidget {
                   }
                 },
               ),
+              if (espController != null)
+                ListTile(
+                  leading: const Icon(Icons.wifi),
+                  title: Text(tr.wifiSettings),
+                  subtitle: Text(tr.wifiSettingsHelp),
+                  trailing: const Icon(Icons.chevron_right),
+                  onTap: () => Navigator.of(context).push(
+                    MaterialPageRoute<void>(
+                      builder: (_) => WifiPage(settings: controller, esp: espController),
+                    ),
+                  ),
+                ),
               _Section(tr.sectionDevices),
               for (var i = 0; i < s.devices.length; i++)
                 ListTile(

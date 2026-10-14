@@ -1,8 +1,10 @@
+import 'package:esp32_controller/device_icons.dart';
 import 'package:esp32_controller/models.dart';
 import 'package:esp32_controller/settings.dart';
 import 'package:esp32_controller/voice.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 void main() {
   test('default ESP32 URL is an HTTP URL with an IP host', () {
@@ -159,6 +161,113 @@ void main() {
     test('unknown or incomplete sentences return null', () {
       expect(parseVoice('hello there', devices), isNull);
       expect(parseVoice('light', devices), isNull);
+    });
+  });
+
+  group('device list and Wi-Fi (firmware v3)', () {
+    test('state from an old firmware still parses and gets default pins', () {
+      final st = Esp32State.fromJson({'name': 'Home', 'devices': []});
+      expect(st.mode, 'sta');
+      expect(st.wifiConnected, isTrue);
+      expect(st.apActive, isFalse);
+      expect(st.pinsOut, defaultOutPins);
+      expect(st.pinsIn, defaultInPins);
+      expect(st.maxDevices, 24);
+    });
+
+    test('state from firmware v3 carries pins, mode and device GPIO', () {
+      final st = Esp32State.fromJson({
+        'mode': 'ap',
+        'apSsid': 'SmartHome-Setup',
+        'ip': '192.168.4.1',
+        'maxDevices': 24,
+        'pinsOut': [5, 13, 23],
+        'pinsIn': [34],
+        'devices': [
+          {'id': 'd1', 'name': 'Bulb 2', 'icon': 'light', 'pin': 23, 'room': 1},
+        ],
+      });
+      expect(st.apActive, isTrue);
+      expect(st.wifiConnected, isFalse);
+      expect(st.apSsid, 'SmartHome-Setup');
+      expect(st.pinsOut, [5, 13, 23]);
+      expect(st.pinsIn, [34]);
+      expect(st.devices.single.pin, 23);
+      expect(st.devices.single.room, 1);
+      // toggling a device keeps the pin list and Wi-Fi mode
+      final flipped = st.withDevice('d1', on: true);
+      expect(flipped.devices.single.on, isTrue);
+      expect(flipped.devices.single.pin, 23);
+      expect(flipped.pinsOut, [5, 13, 23]);
+      expect(flipped.apSsid, 'SmartHome-Setup');
+    });
+
+    test('Wi-Fi scan and status answers parse', () {
+      final scan = WifiScan.fromJson({
+        'scanning': false,
+        'networks': [
+          {'ssid': 'चाय वाला', 'rssi': -48, 'secure': true},
+          {'ssid': 'Cafe', 'rssi': -70, 'secure': false},
+          {'ssid': '', 'rssi': -80, 'secure': true},
+        ],
+      });
+      expect(scan.scanning, isFalse);
+      expect(scan.networks.length, 2);
+      expect(scan.networks.first.ssid, 'चाय वाला');
+      expect(scan.networks[1].secure, isFalse);
+
+      final status = WifiStatus.fromJson({
+        'state': 'failed',
+        'connected': false,
+        'ssid': '',
+        'ip': '192.168.4.1',
+        'mode': 'ap',
+        'error': 'could not connect',
+        'saved': true,
+      });
+      expect(status.state, 'failed');
+      expect(status.connected, isFalse);
+      expect(status.saved, isTrue);
+    });
+
+    test('icons decide the device type', () {
+      expect(typeForIcon('light'), 'switch');
+      expect(typeForIcon('plug'), 'switch');
+      expect(typeForIcon('lock'), 'lock');
+      expect(typeForIcon('pir'), 'pir');
+      expect(iconsForType('pir'), ['pir']);
+      expect(iconsForType('switch'), contains('fan'));
+      expect(allIcons, containsAll(['light', 'fan', 'lock', 'pir']));
+    });
+
+    test('a device called by its own name is the only one switched', () {
+      const devices = [
+        Esp32Device(
+            id: 'd1', name: 'Bulb 1', type: 'switch', group: 'Lighting',
+            icon: 'light', room: 0, on: false),
+        Esp32Device(
+            id: 'd2', name: 'Bulb 2', type: 'switch', group: 'Lighting',
+            icon: 'light', room: 0, on: false),
+      ];
+      expect(parseVoice('bulb 2 on', devices)?.set, {'d2': true});
+      expect(parseVoice('light on', devices)?.set, {'d1': true, 'd2': true});
+    });
+
+    test('the active ESP32 address can be changed and the setup address added', () async {
+      TestWidgetsFlutterBinding.ensureInitialized();
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      final controller = await SettingsController.load();
+      await controller.setActiveUrl('http://10.0.0.77/');
+      expect(controller.value.activeUrl, 'http://10.0.0.77/');
+      expect(controller.value.devices.length, 1);
+
+      await controller.activateSetupDevice();
+      expect(controller.value.devices.length, 2);
+      expect(controller.value.activeUrl, setupEsp32Url);
+
+      // asking again selects the same entry instead of adding another one
+      await controller.activateSetupDevice();
+      expect(controller.value.devices.length, 2);
     });
   });
 }

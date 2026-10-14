@@ -20,12 +20,26 @@ class ApiException implements Exception {
   String toString() => 'ApiException($kind, $detail)';
 }
 
+/// Result of a call that returns data: either [data] or a user-readable [error].
+class ApiResult<T> {
+  const ApiResult.ok(this.data) : error = null;
+  const ApiResult.fail(this.error) : data = null;
+
+  final T? data;
+  final String? error;
+
+  bool get ok => error == null;
+}
+
 /// Talks to the ESP32 firmware over plain HTTP on the local network.
 ///
 ///   GET  /api/state                     -> everything (sensors, devices, wifi)
 ///   POST /api/set?id=light&on=1         -> turn one relay on / off
 ///   POST /api/dnd?on=1                  -> Do-Not-Disturb flag
 ///   POST /api/scene?id=alloff|goodnight|dinner
+///   POST /api/device/add|update|delete  -> manage the saved device list
+///   GET  /api/wifi/status|scan          -> Wi-Fi state / nearby networks
+///   POST /api/wifi/connect|reset        -> join a new network / forget Wi-Fi
 ///
 /// The controller polls /api/state every few seconds, applies changes
 /// optimistically (the tile reacts instantly) and rolls back on failure.
@@ -184,6 +198,104 @@ class Esp32Controller extends ChangeNotifier with WidgetsBindingObserver {
   Future<String?> runScene(String id) =>
       _write('scene', {'id': id}, busyKey: 'scene:$id');
 
+  // ------------------------------------------------------- device list
+  /// Adds a new device to the list saved on the ESP32.
+  Future<String?> addDevice({
+    required String name,
+    required String icon,
+    required int pin,
+    required int room,
+    int? watts,
+  }) =>
+      _write(
+        'device/add',
+        {
+          'name': name,
+          'icon': icon,
+          'pin': '$pin',
+          'room': '$room',
+          if (watts != null) 'watts': '$watts',
+        },
+        busyKey: 'device:add',
+      );
+
+  /// Changes name / icon / GPIO pin / room of a saved device.
+  Future<String?> updateDevice(
+    String id, {
+    String? name,
+    String? icon,
+    int? pin,
+    int? room,
+    int? watts,
+  }) =>
+      _write(
+        'device/update',
+        {
+          'id': id,
+          if (name != null) 'name': name,
+          if (icon != null) 'icon': icon,
+          if (pin != null) 'pin': '$pin',
+          if (room != null) 'room': '$room',
+          if (watts != null) 'watts': '$watts',
+        },
+        busyKey: id,
+      );
+
+  /// Removes a device from the list saved on the ESP32.
+  Future<String?> deleteDevice(String id) =>
+      _write('device/delete', {'id': id}, busyKey: id);
+
+  // --------------------------------------------------------------- Wi-Fi
+  // These talk to the ESP32 directly (not through the polled state), so they
+  // also work while the ESP32 is in setup mode.
+
+  /// Asks the ESP32 for nearby networks. Pass [rescan] on the first call, then
+  /// call again (without it) until the result says `scanning == false`.
+  Future<ApiResult<WifiScan>> wifiScan({bool rescan = false}) async {
+    try {
+      final json = await _call('GET', 'wifi/scan', rescan ? {'rescan': '1'} : null);
+      return ApiResult<WifiScan>.ok(WifiScan.fromJson(json));
+    } catch (e) {
+      return ApiResult<WifiScan>.fail(_friendly(e));
+    }
+  }
+
+  Future<ApiResult<WifiStatus>> wifiStatus() async {
+    try {
+      final json = await _call('GET', 'wifi/status');
+      return ApiResult<WifiStatus>.ok(WifiStatus.fromJson(json));
+    } catch (e) {
+      return ApiResult<WifiStatus>.fail(_friendly(e));
+    }
+  }
+
+  /// Tells the ESP32 to join [ssid]. Returns null when the request was
+  /// accepted; the ESP32 then switches networks, so poll [wifiStatus].
+  Future<String?> wifiConnect(String ssid, String password) async {
+    try {
+      final json = await _call('POST', 'wifi/connect', {'ssid': ssid, 'pass': password});
+      if (json['ok'] == false) {
+        return json['error']?.toString() ?? _tr.errServer;
+      }
+      return null;
+    } catch (e) {
+      return _friendly(e);
+    }
+  }
+
+  /// Forgets the saved Wi-Fi; the ESP32 restarts in setup (hotspot) mode.
+  Future<String?> wifiReset() async {
+    try {
+      final json = await _call('POST', 'wifi/reset');
+      if (json['ok'] == false) {
+        return json['error']?.toString() ?? _tr.errServer;
+      }
+      return null;
+    } catch (e) {
+      return _friendly(e);
+    }
+  }
+
   Future<String?> _write(
     String name,
     Map<String, String> query, {
@@ -256,6 +368,11 @@ class Esp32Controller extends ChangeNotifier with WidgetsBindingObserver {
       if (json == null && (res.statusCode == 404 || res.statusCode == 200)) {
         throw ApiException(ApiErrorKind.firmware);
       }
+      // A JSON 404 "not found" means this endpoint does not exist: the ESP32
+      // still runs an older firmware (e.g. v2 has no /api/device or /api/wifi).
+      if (res.statusCode == 404 && json != null && json['error'] == 'not found') {
+        throw ApiException(ApiErrorKind.firmware);
+      }
       if (res.statusCode < 200 || res.statusCode >= 300) {
         throw ApiException(
           ApiErrorKind.server,
@@ -280,9 +397,10 @@ class Esp32Controller extends ChangeNotifier with WidgetsBindingObserver {
   String _friendly(Object e) {
     final tr = _tr;
     if (e is ApiException) {
+      final detail = e.detail;
       return switch (e.kind) {
         ApiErrorKind.auth => tr.errAuth,
-        ApiErrorKind.server => e.detail ?? tr.errServer,
+        ApiErrorKind.server => detail == null ? tr.errServer : tr.fwError(detail),
         ApiErrorKind.firmware => tr.errFirmware,
         ApiErrorKind.network => tr.errNetwork,
       };

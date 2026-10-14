@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 const String defaultEsp32Url = 'http://192.168.1.37/';
+/// Address of the ESP32's own setup hotspot ("SmartHome-Setup").
+const String setupEsp32Url = 'http://192.168.4.1/';
 // Backwards-compatible constant used by the project's URL smoke test.
 const String esp32Url = defaultEsp32Url;
 const int defaultAccent = 0xFF2F7BFF;
@@ -219,4 +221,32 @@ class SettingsController extends ChangeNotifier {
   }
 
   Future<void> reset() => update(const AppSettings());
+
+  /// Points the currently selected ESP32 entry at another address
+  /// (used after the ESP32 got a new IP from a new router).
+  Future<void> setActiveUrl(String url) {
+    final s = _value;
+    if (s.devices.isEmpty) {
+      return update(s.copyWith(
+        devices: [Device(name: 'ESP32', url: url)],
+        activeDevice: 0,
+      ));
+    }
+    final i = s.activeDevice.clamp(0, s.devices.length - 1).toInt();
+    final list = [...s.devices];
+    list[i] = Device(name: list[i].name, url: url);
+    return update(s.copyWith(devices: list, activeDevice: i));
+  }
+
+  /// Adds (once) and selects an "ESP32 Setup" entry for the setup hotspot,
+  /// so the app can talk to an ESP32 that has no router connection yet.
+  Future<void> activateSetupDevice() {
+    final s = _value;
+    final i = s.devices.indexWhere((d) => Uri.tryParse(d.url)?.host == '192.168.4.1');
+    if (i >= 0) return update(s.copyWith(activeDevice: i));
+    return update(s.copyWith(
+      devices: [...s.devices, const Device(name: 'ESP32 Setup', url: setupEsp32Url)],
+      activeDevice: s.devices.length,
+    ));
+  }
 }

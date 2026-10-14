@@ -4,6 +4,8 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import 'dashboard_widgets.dart';
+import 'device_editor.dart';
+import 'device_icons.dart';
 import 'esp32_api.dart';
 import 'models.dart';
 import 'settings.dart';
@@ -11,6 +13,7 @@ import 'settings_page.dart';
 import 'strings.dart';
 import 'voice.dart';
 import 'web_page.dart';
+import 'wifi_page.dart';
 
 /// Order in which control groups are shown. Unknown groups follow after these.
 const List<String> _groupOrder = ['Lighting', 'Climate', 'Security', 'Scenes'];
@@ -48,37 +51,6 @@ GlyphBuilder _iconGlyph(IconData icon) =>
 GlyphBuilder _shapeGlyph(String kind) =>
     (color, size) => Glyph(kind, color: color, size: size);
 
-GlyphBuilder _glyphFor(String key, bool on) {
-  switch (key) {
-    case 'light':
-      return _iconGlyph(on ? Icons.lightbulb : Icons.lightbulb_outline);
-    case 'fan':
-      return _iconGlyph(Icons.toys);
-    case 'heater':
-      return _shapeGlyph('radiator');
-    case 'curtain':
-      return _shapeGlyph('blinds');
-    case 'purifier':
-      return _shapeGlyph('purifier');
-    case 'siren':
-      return _iconGlyph(Icons.notifications_active);
-    case 'lock':
-      return _iconGlyph(on ? Icons.lock : Icons.lock_open);
-    case 'pir':
-      return (color, size) => Text(
-            'PIR',
-            style: TextStyle(
-              fontSize: size * 0.5,
-              fontWeight: FontWeight.w800,
-              letterSpacing: 0.5,
-              color: color,
-            ),
-          );
-    default:
-      return _iconGlyph(Icons.power);
-  }
-}
-
 class DashboardPage extends StatefulWidget {
   const DashboardPage({super.key, required this.settings, required this.esp});
 
@@ -113,7 +85,17 @@ class _DashboardPageState extends State<DashboardPage> {
 
   void _openSettings() {
     Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => SettingsPage(controller: _sc)),
+      MaterialPageRoute<void>(
+        builder: (_) => SettingsPage(controller: _sc, esp: _esp),
+      ),
+    );
+  }
+
+  void _openWifi() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => WifiPage(settings: _sc, esp: _esp),
+      ),
     );
   }
 
@@ -241,16 +223,137 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
-  void _showAddControl() {
+  // ------------------------------------------------- add / edit / remove
+  Future<void> _addDevice({String? icon}) async {
     final tr = Tr.of(_s);
-    showDialog<void>(
+    final st = _esp.state;
+    if (st == null || !_esp.online) {
+      _snack(tr.errNetwork);
+      return;
+    }
+    if (st.devices.length >= st.maxDevices) {
+      _snack(tr.ctlLimit(st.maxDevices));
+      return;
+    }
+    final draft = await showDeviceEditor(
+      context,
+      tr: tr,
+      state: st,
+      rooms: _s.rooms,
+      room: _room,
+      presetIcon: icon,
+    );
+    if (draft == null || !mounted) return;
+    final error = await _esp.addDevice(
+      name: draft.name,
+      icon: draft.icon,
+      pin: draft.pin,
+      room: draft.room,
+      watts: draft.watts,
+    );
+    _snack(error ?? tr.ctlAdded);
+  }
+
+  Future<void> _editControl(Esp32Device d) async {
+    final tr = Tr.of(_s);
+    final st = _esp.state;
+    if (st == null || !_esp.online) {
+      _snack(tr.errNetwork);
+      return;
+    }
+    final draft = await showDeviceEditor(
+      context,
+      tr: tr,
+      state: st,
+      rooms: _s.rooms,
+      room: _roomOfDevice(d, _s.rooms, _s.roomOf),
+      editing: d,
+    );
+    if (draft == null || !mounted) return;
+    final error = await _esp.updateDevice(
+      d.id,
+      name: draft.name,
+      icon: draft.icon,
+      pin: draft.pin,
+      room: draft.room,
+      watts: draft.watts,
+    );
+    if (error == null) {
+      // The ESP32 now has the same room, so drop any older local override.
+      await _sc.update(_s.copyWith(roomOf: {..._s.roomOf, d.id: draft.room}));
+    }
+    _snack(error ?? tr.ctlSaved);
+  }
+
+  Future<void> _deleteControl(Esp32Device d) async {
+    final tr = Tr.of(_s);
+    if (!_esp.online) {
+      _snack(tr.errNetwork);
+      return;
+    }
+    final ok = await showDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
-        title: Text(tr.addControl),
-        content: Text(tr.addControlHelp),
+        title: Text(tr.ctlDeleteQ(d.name)),
+        content: Text(tr.ctlDeleteHelp),
         actions: [
-          FilledButton(onPressed: () => Navigator.pop(ctx), child: Text(tr.ok)),
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text(tr.cancel),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text(tr.delete),
+          ),
         ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final error = await _esp.deleteDevice(d.id);
+    if (error == null && _s.roomOf.containsKey(d.id)) {
+      final next = Map<String, int>.of(_s.roomOf);
+      next.remove(d.id);
+      await _sc.update(_s.copyWith(roomOf: next));
+    }
+    _snack(error ?? tr.ctlDeleted);
+  }
+
+  /// Long-press on a tile: edit (name, icon, GPIO), move room or remove.
+  void _deviceMenu(Esp32Device d) {
+    final tr = Tr.of(_s);
+    showModalBottomSheet<void>(
+      context: context,
+      showDragHandle: true,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.edit_outlined),
+              title: Text(tr.ctlMenuEdit),
+              onTap: () {
+                Navigator.pop(ctx);
+                _editControl(d);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.drive_file_move_outlined),
+              title: Text(tr.ctlMenuMove),
+              onTap: () {
+                Navigator.pop(ctx);
+                _moveDevice(d);
+              },
+            ),
+            ListTile(
+              leading: const Icon(Icons.delete_outline),
+              title: Text(tr.ctlMenuDelete),
+              onTap: () {
+                Navigator.pop(ctx);
+                _deleteControl(d);
+              },
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -441,7 +544,7 @@ class _DashboardPageState extends State<DashboardPage> {
       }
       tiles.add(_Tile(
         group: d.group,
-        glyph: _glyphFor(d.icon, d.on),
+        glyph: glyphFor(d.icon, d.on),
         label: d.name,
         caption: caption,
         active: d.on,
@@ -449,7 +552,7 @@ class _DashboardPageState extends State<DashboardPage> {
         span: d.isLock ? 2 : 1,
         busy: _esp.isBusy(d.id),
         onTap: d.controllable ? () => _toggle(d) : null,
-        onLongPress: () => _moveDevice(d),
+        onLongPress: () => _deviceMenu(d),
       ));
     }
 
@@ -528,7 +631,7 @@ class _DashboardPageState extends State<DashboardPage> {
           group: g,
           glyph: _iconGlyph(Icons.add),
           label: tr.addControl,
-          onTap: _showAddControl,
+          onTap: () => _addDevice(),
         ),
       ];
       final cells = items.fold<int>(0, (sum, t) => sum + t.span);
@@ -608,16 +711,25 @@ class _DashboardPageState extends State<DashboardPage> {
             ],
           ),
         IconButton(
+          visualDensity: VisualDensity.compact,
+          tooltip: tr.wifiSettings,
+          icon: Icon(_esp.online ? Icons.wifi : Icons.wifi_off),
+          onPressed: _openWifi,
+        ),
+        IconButton(
+          visualDensity: VisualDensity.compact,
           tooltip: tr.refresh,
           icon: const Icon(Icons.refresh),
           onPressed: _esp.refresh,
         ),
         IconButton(
+          visualDensity: VisualDensity.compact,
           tooltip: tr.openWebPage,
           icon: const Icon(Icons.language),
           onPressed: _openWeb,
         ),
         IconButton(
+          visualDensity: VisualDensity.compact,
           tooltip: tr.settings,
           icon: const Icon(Icons.tune),
           onPressed: _openSettings,
@@ -631,9 +743,12 @@ class _DashboardPageState extends State<DashboardPage> {
     final ssid = (st == null || st.ssid.isEmpty) ? '—' : st.ssid;
     final wifiCard = StatusCard(
       icon: Icons.memory,
-      title: '${tr.connectedTo}$ssid',
+      title: (st != null && st.apActive && !st.wifiConnected)
+          ? tr.setupHotspotOn(st.apSsid)
+          : '${tr.connectedTo}$ssid',
       subtitle: '${tr.status}${online ? tr.online : tr.offline}',
       ok: online,
+      onTap: _openWifi,
     );
     final systemCard = StatusCard(
       icon: Icons.memory,
@@ -750,6 +865,31 @@ class _DashboardPageState extends State<DashboardPage> {
     );
   }
 
+  /// "Add Bulb", "Add Fan" and "Add Device" shortcuts.
+  Widget _addBar(Tr tr) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        FilledButton.tonalIcon(
+          onPressed: () => _addDevice(icon: 'light'),
+          icon: const Icon(Icons.lightbulb_outline),
+          label: Text(tr.addBulb),
+        ),
+        FilledButton.tonalIcon(
+          onPressed: () => _addDevice(icon: 'fan'),
+          icon: const Icon(Icons.toys),
+          label: Text(tr.addFan),
+        ),
+        FilledButton.tonalIcon(
+          onPressed: () => _addDevice(),
+          icon: const Icon(Icons.add),
+          label: Text(tr.addAnyDevice),
+        ),
+      ],
+    );
+  }
+
   Widget _energy(Tr tr, Esp32State st, int room, Color accent) {
     final s = _s;
     final ids = <String>{};
@@ -822,6 +962,11 @@ class _DashboardPageState extends State<DashboardPage> {
                 onPressed: _esp.refresh,
                 icon: const Icon(Icons.refresh),
                 label: Text(tr.retry),
+              ),
+              OutlinedButton.icon(
+                onPressed: _openWifi,
+                icon: const Icon(Icons.wifi),
+                label: Text(tr.wifiSettings),
               ),
               OutlinedButton.icon(
                 onPressed: _openSettings,
@@ -926,6 +1071,8 @@ class _DashboardPageState extends State<DashboardPage> {
                                         const SizedBox(height: 14),
                                       ],
                                       _roomBar(tr, accent, room),
+                                      const SizedBox(height: 10),
+                                      _addBar(tr),
                                       const SizedBox(height: 14),
                                       if (_showEnergy) ...[
                                       _energy(tr, st, room, accent),
